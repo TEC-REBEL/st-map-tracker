@@ -14,7 +14,20 @@ import { ToolManager } from '../../../tool-calling.js';
 
 /* ───────────────────── constants ───────────────────── */
 
-const EXT_NAME = 'third-party/map-tracker';
+const getExtensionName = () => {
+    try {
+        const url = new URL(import.meta.url);
+        const parts = url.pathname.split('/');
+        const extIdx = parts.indexOf('extensions');
+        if (extIdx !== -1 && parts.length > extIdx + 2) {
+            return parts.slice(extIdx + 1, parts.length - 1).join('/');
+        }
+    } catch (e) {
+        console.error(e);
+    }
+    return 'third-party/map-tracker';
+};
+const EXT_NAME = getExtensionName();
 const PROMPT_KEY = 'map_tracker_prompt';
 const LOG_PREFIX = '[Map Tracker]';
 const VERSION = '1.4.0';
