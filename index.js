@@ -2458,8 +2458,16 @@ Rules:
                 if (!response) continue;
 
                 let cleaned = response.trim();
+                
+                // Robustly strip AI reasoning/thinking blocks (like <think>...)
+                cleaned = cleaned.replace(/<think>[\s\S]*?<\/think>|<thought>[\s\S]*?<\/thought>/gi, '').trim();
+
                 if (cleaned.startsWith('```')) {
                     cleaned = cleaned.replace(/^```[a-zA-Z]*\n/, '').replace(/\n```$/, '').trim();
+                }
+                const markdownMatch = cleaned.match(/```(?:json)?\s*([\s\S]*?)```/i);
+                if (markdownMatch) {
+                    cleaned = markdownMatch[1].trim();
                 }
 
                 const startIdx = cleaned.indexOf('[');
@@ -2468,7 +2476,18 @@ Rules:
                     cleaned = cleaned.substring(startIdx, endIdx + 1);
                 }
 
-                const data = JSON.parse(cleaned);
+                let data;
+                try {
+                    data = JSON.parse(cleaned);
+                } catch (jsonErr) {
+                    console.warn(LOG_PREFIX, 'Failed to parse JSON array directly, trying regex extraction', jsonErr);
+                    const arrayMatch = cleaned.match(/\[\s*\{[\s\S]*?\}\s*\]/);
+                    if (arrayMatch) {
+                        data = JSON.parse(arrayMatch[0]);
+                    } else {
+                        throw jsonErr;
+                    }
+                }
                 if (Array.isArray(data)) {
                     for (const entry of data) {
                         const msgIdx = parseInt(entry.messageIndex);
