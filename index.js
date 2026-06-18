@@ -9,7 +9,7 @@
  */
 
 import { getContext, extension_settings, renderExtensionTemplateAsync } from '../../../extensions.js';
-import { eventSource, event_types, saveSettingsDebounced, setExtensionPrompt, extension_prompt_types, extension_prompt_roles } from '../../../../script.js';
+import { eventSource, event_types, saveSettingsDebounced, setExtensionPrompt, extension_prompt_types, extension_prompt_roles, generateRaw } from '../../../../script.js';
 import { ToolManager } from '../../../tool-calling.js';
 
 /* ───────────────────── constants ───────────────────── */
@@ -77,6 +77,11 @@ const DEFAULT_SETTINGS = {
     nodeColor: '#6a9fdf',
     activeColor: '#ff6b9d',
     locations: {},
+    useFuzzyMatching: true,
+    showMinimap: true,
+    showFogOfWar: false,
+    timeOfDayMode: 'dynamic',
+    showTravelPaths: true,
 };
 
 /* ──────────────────── themes ──────────────────── */
@@ -210,6 +215,42 @@ const THEMES = {
         charNameColor: 'rgba(180,180,200,0.7)',
         legendBg: 'rgba(0,0,0,0.15)',
     },
+    solarflares: {
+        label: '🔥 Solar Flares',
+        bgInner: 'rgba(56,12,4,0.65)', bgOuter: 'rgba(18,2,0,0.55)',
+        starHueA: 15, starHueB: 45, starSat: 85, starLum: 80,
+        edgeColor: '220,100,50', edgeActiveColor: '255,200,50',
+        selectionRing: 'rgba(255,220,80,0.8)',
+        arrowColor: 'rgba(255,150,50,0.6)',
+        textColor: '255,240,220', emptyTextColor: '220,160,120',
+        charTagColor: 'rgba(255,200,100,0.9)',
+        nodeColor: '#e05a36', activeColor: '#ffc048',
+        popBg: 'linear-gradient(135deg,rgba(30,6,0,0.95),rgba(45,12,3,0.93),rgba(24,4,0,0.96))',
+        popBorder: 'rgba(220,80,40,0.2)', popGlow: 'rgba(180,50,20,0.09)',
+        headerBorder: 'rgba(220,80,40,0.12)',
+        panelBg: 'rgba(25,5,0,0.22)', panelBorder: 'rgba(220,80,40,0.12)',
+        accentText: 'rgba(255,190,140,0.9)', mutedText: 'rgba(200,130,100,0.55)',
+        charNameColor: 'rgba(255,200,100,0.9)',
+        legendBg: 'rgba(15,3,0,0.2)',
+    },
+    glacial: {
+        label: '❄️ Glacial Drift',
+        bgInner: 'rgba(10,38,50,0.55)', bgOuter: 'rgba(2,12,18,0.45)',
+        starHueA: 175, starHueB: 205, starSat: 70, starLum: 85,
+        edgeColor: '100,190,210', edgeActiveColor: '140,255,255',
+        selectionRing: 'rgba(150,255,255,0.75)',
+        arrowColor: 'rgba(120,240,255,0.55)',
+        textColor: '230,250,255', emptyTextColor: '140,200,220',
+        charTagColor: 'rgba(180,245,255,0.85)',
+        nodeColor: '#4bcffa', activeColor: '#34e7e4',
+        popBg: 'linear-gradient(135deg,rgba(4,18,24,0.94),rgba(8,28,36,0.92),rgba(2,12,16,0.95))',
+        popBorder: 'rgba(80,180,200,0.18)', popGlow: 'rgba(50,150,180,0.07)',
+        headerBorder: 'rgba(80,180,200,0.1)',
+        panelBg: 'rgba(0,15,20,0.18)', panelBorder: 'rgba(80,180,200,0.1)',
+        accentText: 'rgba(180,230,250,0.9)', mutedText: 'rgba(130,180,200,0.55)',
+        charNameColor: 'rgba(180,245,255,0.85)',
+        legendBg: 'rgba(0,8,12,0.15)',
+    },
 };
 
 function getTheme() {
@@ -269,6 +310,24 @@ let is3DMode = false;
 let orbit = { angleX: 0, angleY: 0.55 }; // horizontal (Y-axis rotation), vertical tilt (X-axis rotation)
 let orbitStart = null;
 
+// New State Variables for Travel Path, Spawn Anims, Minimap, and Time of Day
+let isPanningMinimap = false;
+let minimapBounds = { minX: 0, maxX: 0, minY: 0, maxY: 0, size: 110, margin: 15 };
+let charLastKnownLoc = {};
+let travelAnimations = [];
+let nodeDiscoveryTimes = {};
+let cloudClouds = null;
+let customParticlesState = null;
+
+function resetTravelState() {
+    charLastKnownLoc = {};
+    travelAnimations = [];
+}
+
+function resetSpawnTimes() {
+    nodeDiscoveryTimes = {};
+}
+
 /* ──────────────────── helpers ──────────────────── */
 
 function settings() { return extension_settings[EXT_NAME]; }
@@ -286,13 +345,59 @@ function saveLocs() { saveSettingsDebounced(); }
  * Normalize a location name to prevent duplicates from casing/spacing.
  * Returns the canonical (first-seen) version.
  */
+function levenshteinSimilarity(s1, s2) {
+    let longer = s1.toLowerCase().trim();
+    let shorter = s2.toLowerCase().trim();
+    if (longer.length < shorter.length) {
+        let temp = longer; longer = shorter; shorter = temp;
+    }
+    let longerLength = longer.length;
+    if (longerLength === 0) return 1.0;
+    
+    const costs = [];
+    for (let i = 0; i <= longer.length; i++) {
+        let lastValue = i;
+        for (let j = 0; j <= shorter.length; j++) {
+            if (i === 0) costs[j] = j;
+            else {
+                if (j > 0) {
+                    let newValue = costs[j - 1];
+                    if (longer.charAt(i - 1) !== shorter.charAt(j - 1)) {
+                        newValue = Math.min(Math.min(newValue, lastValue), costs[j]) + 1;
+                    }
+                    costs[j - 1] = lastValue;
+                    lastValue = newValue;
+                }
+            }
+        }
+        if (i > 0) costs[shorter.length] = lastValue;
+    }
+    const dist = costs[shorter.length];
+    return (longerLength - dist) / parseFloat(longerLength);
+}
+
 function canonicalLocation(rawName) {
     const key = rawName.toLowerCase().replace(/\s+/g, ' ').trim();
     const locs = chatLocations();
+    
+    // First try exact normalized match
     for (const entry of locs) {
         const entryKey = entry.location.toLowerCase().replace(/\s+/g, ' ').trim();
         if (entryKey === key) return entry.location;
     }
+    
+    // If not found and fuzzy matching enabled, try fuzzy match
+    const s = settings();
+    if (s.useFuzzyMatching) {
+        for (const entry of locs) {
+            const entryKey = entry.location.toLowerCase().replace(/\s+/g, ' ').trim();
+            if (levenshteinSimilarity(entryKey, key) > 0.82) {
+                console.log(LOG_PREFIX, `Fuzzy matched location "${rawName}" to existing "${entry.location}"`);
+                return entry.location;
+            }
+        }
+    }
+    
     return rawName.trim();
 }
 
@@ -555,6 +660,8 @@ function deleteNode(locationName) {
     const s = settings();
     s.locations[currentChatId] = chatLocations().filter(l => l.location !== locationName);
     if (selectedNode === locationName) { selectedNode = null; hideDetailPanel(); }
+    resetTravelState();
+    if (nodeDiscoveryTimes[locationName]) delete nodeDiscoveryTimes[locationName];
     saveLocs();
     console.log(LOG_PREFIX, `Deleted node: "${locationName}"`);
 }
@@ -565,6 +672,8 @@ function clearAllNodes() {
         s.locations[currentChatId] = [];
         selectedNode = null;
         hideDetailPanel();
+        resetTravelState();
+        resetSpawnTimes();
         saveLocs();
         console.log(LOG_PREFIX, 'Cleared all nodes');
     }
@@ -594,6 +703,8 @@ function onChatChanged() {
     viewPath = [];
     selectedNode = null;
     hideDetailPanel();
+    resetTravelState();
+    resetSpawnTimes();
     injectPrompt();
     scanAllMessages();
     requestAnimationFrame(() => document.querySelectorAll('.mes').forEach(el => stripTagsFromElement(el)));
@@ -804,6 +915,27 @@ function updateZoomLabel() {
 
 /* ──── canvas interactions ──── */
 
+function handleMinimapClick(cx, cy, mx, my, W, H) {
+    const size = minimapBounds.size;
+    const minX = minimapBounds.minX;
+    const maxX = minimapBounds.maxX;
+    const minY = minimapBounds.minY;
+    const maxY = minimapBounds.maxY;
+    const boxW = maxX - minX;
+    const boxH = maxY - minY;
+
+    if (boxW <= 0 || boxH <= 0) return;
+
+    const px = Math.max(0, Math.min(1, (cx - mx) / size));
+    const py = Math.max(0, Math.min(1, (cy - my) / size));
+
+    const targetWorldX = minX + px * boxW;
+    const targetWorldY = minY + py * boxH;
+
+    camera.x = -(targetWorldX - W / 2) * camera.zoom;
+    camera.y = -(targetWorldY - H / 2) * camera.zoom;
+}
+
 function setupCanvasInteractions() {
     const wrap = document.getElementById('map-tracker-canvas-wrap');
     if (!wrap) return;
@@ -822,6 +954,24 @@ function setupCanvasInteractions() {
     let dragButton = -1;
 
     wrap.addEventListener('mousedown', (e) => {
+        const rect = wrap.getBoundingClientRect();
+        const cx = e.clientX - rect.left;
+        const cy = e.clientY - rect.top;
+        const dpr = window.devicePixelRatio || 1;
+        const W = mapCanvas.width / dpr;
+        const H = mapCanvas.height / dpr;
+        const size = minimapBounds.size;
+        const margin = minimapBounds.margin;
+        const mx = W - size - margin;
+        const my = H - size - margin;
+
+        if (settings().showMinimap && cx >= mx && cx <= mx + size && cy >= my && cy <= my + size) {
+            isPanningMinimap = true;
+            handleMinimapClick(cx, cy, mx, my, W, H);
+            e.preventDefault();
+            return;
+        }
+
         if (e.button === 0 || e.button === 1 || e.button === 2) {
             isPanning = true;
             panMoved = false;
@@ -836,6 +986,22 @@ function setupCanvasInteractions() {
     });
 
     window.addEventListener('mousemove', (e) => {
+        const rect = wrap.getBoundingClientRect();
+        const cx = e.clientX - rect.left;
+        const cy = e.clientY - rect.top;
+        const dpr = window.devicePixelRatio || 1;
+        const W = mapCanvas.width / dpr;
+        const H = mapCanvas.height / dpr;
+
+        if (isPanningMinimap) {
+            const size = minimapBounds.size;
+            const margin = minimapBounds.margin;
+            const mx = W - size - margin;
+            const my = H - size - margin;
+            handleMinimapClick(cx, cy, mx, my, W, H);
+            return;
+        }
+
         if (!isPanning) return;
         const dx = e.clientX - panStart.x;
         const dy = e.clientY - panStart.y;
@@ -852,6 +1018,10 @@ function setupCanvasInteractions() {
     });
 
     window.addEventListener('mouseup', (e) => {
+        if (isPanningMinimap) {
+            isPanningMinimap = false;
+            return;
+        }
         if (isPanning && !panMoved && e.button === 0) handleCanvasClick(e);
         isPanning = false;
         orbitStart = null;
@@ -1368,6 +1538,313 @@ function draw3DGrid(W, H, t) {
     mapCtx.restore();
 }
 
+function computeNodeVisibilities(uniqueLocs, edges, currentLoc) {
+    const vis = {};
+    uniqueLocs.forEach(loc => vis[loc] = 0.2); // Default dimmed / unvisited fog
+    if (!currentLoc) {
+        uniqueLocs.forEach(loc => vis[loc] = 1.0);
+        return vis;
+    }
+    
+    // BFS starting from the current location
+    const queue = [[currentLoc, 0]];
+    const visited = new Set([currentLoc]);
+    
+    while (queue.length > 0) {
+        const [node, dist] = queue.shift();
+        let opacity = 1.0;
+        if (dist === 1) opacity = 0.6;
+        else if (dist === 2) opacity = 0.3;
+        else if (dist > 2) opacity = 0.15;
+        
+        vis[node] = opacity;
+        
+        // Find neighbors
+        for (const [u, v] of edges) {
+            if (u === node && !visited.has(v)) {
+                visited.add(v);
+                queue.push([v, dist + 1]);
+            } else if (v === node && !visited.has(u)) {
+                visited.add(u);
+                queue.push([u, dist + 1]);
+            }
+        }
+    }
+    return vis;
+}
+
+function getTimeOfDayPhase() {
+    const s = settings();
+    if (s.timeOfDayMode !== 'dynamic') return s.timeOfDayMode;
+    
+    const hour = new Date().getHours();
+    if (hour >= 6 && hour < 11) return 'sunrise';
+    if (hour >= 11 && hour < 17) return 'day';
+    if (hour >= 17 && hour < 20) return 'sunset';
+    return 'night';
+}
+
+function renderBackgroundByPhase(W, H, phase, t) {
+    const ctx = mapCtx;
+    if (phase === 'night') {
+        // Standard starry night
+        const bgGrad = ctx.createRadialGradient(W / 2, H / 2, 0, W / 2, H / 2, Math.max(W, H) * 0.75);
+        bgGrad.addColorStop(0, t.bgInner);
+        bgGrad.addColorStop(0.5, t.bgOuter);
+        bgGrad.addColorStop(1, t.bgOuter);
+        ctx.fillStyle = bgGrad;
+        ctx.fillRect(0, 0, W, H);
+        
+        const glowX = W * 0.5 + Math.sin(starTime * 0.15) * W * 0.2;
+        const glowY = H * 0.5 + Math.cos(starTime * 0.12) * H * 0.15;
+        const bgGlow = ctx.createRadialGradient(glowX, glowY, 0, glowX, glowY, Math.max(W, H) * 0.4);
+        bgGlow.addColorStop(0, `hsla(${(t.starHueA + t.starHueB) / 2}, ${t.starSat}%, 20%, 0.04)`);
+        bgGlow.addColorStop(1, 'transparent');
+        ctx.fillStyle = bgGlow;
+        ctx.fillRect(0, 0, W, H);
+        
+        drawStarfield(W, H);
+        drawAmbientParticles(W, H);
+    } else if (phase === 'sunrise') {
+        const grad = ctx.createLinearGradient(0, 0, 0, H);
+        grad.addColorStop(0, '#ffd3b6');
+        grad.addColorStop(0.5, '#ffaaa5');
+        grad.addColorStop(1, '#a8e6cf');
+        ctx.fillStyle = grad;
+        ctx.fillRect(0, 0, W, H);
+        
+        const sunGrad = ctx.createRadialGradient(W * 0.2, H * 0.3, 0, W * 0.2, H * 0.3, W * 0.45);
+        sunGrad.addColorStop(0, 'rgba(255, 243, 204, 0.4)');
+        sunGrad.addColorStop(0.5, 'rgba(255, 170, 165, 0.15)');
+        sunGrad.addColorStop(1, 'rgba(0, 0, 0, 0)');
+        ctx.fillStyle = sunGrad;
+        ctx.fillRect(0, 0, W, H);
+        
+        drawCustomParticles(W, H, 15, 30, 85, 0.4, 0.4);
+    } else if (phase === 'day') {
+        const grad = ctx.createLinearGradient(0, 0, 0, H);
+        grad.addColorStop(0, '#4a90e2');
+        grad.addColorStop(1, '#87ceeb');
+        ctx.fillStyle = grad;
+        ctx.fillRect(0, 0, W, H);
+        
+        const sunGrad = ctx.createRadialGradient(W * 0.1, H * 0.1, 0, W * 0.1, H * 0.1, W * 0.5);
+        sunGrad.addColorStop(0, 'rgba(255, 255, 240, 0.45)');
+        sunGrad.addColorStop(0.3, 'rgba(255, 255, 255, 0.12)');
+        sunGrad.addColorStop(1, 'rgba(255, 255, 255, 0)');
+        ctx.fillStyle = sunGrad;
+        ctx.fillRect(0, 0, W, H);
+        
+        drawDayClouds(W, H);
+        drawCustomParticles(W, H, 60, 20, 95, 0.2, 0.2);
+    } else if (phase === 'sunset') {
+        const grad = ctx.createLinearGradient(0, 0, 0, H);
+        grad.addColorStop(0, '#2c3e50');
+        grad.addColorStop(0.4, '#8e44ad');
+        grad.addColorStop(0.7, '#e74c3c');
+        grad.addColorStop(1, '#f39c12');
+        ctx.fillStyle = grad;
+        ctx.fillRect(0, 0, W, H);
+        
+        const sunGrad = ctx.createRadialGradient(W * 0.5, H * 0.9, 0, W * 0.5, H * 0.9, W * 0.6);
+        sunGrad.addColorStop(0, 'rgba(255, 220, 100, 0.4)');
+        sunGrad.addColorStop(0.4, 'rgba(231, 76, 60, 0.18)');
+        sunGrad.addColorStop(1, 'rgba(0, 0, 0, 0)');
+        ctx.fillStyle = sunGrad;
+        ctx.fillRect(0, 0, W, H);
+        
+        drawDayClouds(W, H, 'rgba(142, 68, 173, 0.15)');
+        drawCustomParticles(W, H, 25, 60, 75, 0.35, 0.3);
+    }
+}
+
+function drawDayClouds(W, H, color = 'rgba(255, 255, 255, 0.22)') {
+    if (!cloudClouds) cloudClouds = generateClouds(W, H);
+    mapCtx.save();
+    mapCtx.fillStyle = color;
+    for (const c of cloudClouds) {
+        c.x += c.driftX;
+        if (c.x - c.rx > W) c.x = -c.rx;
+        mapCtx.beginPath();
+        mapCtx.ellipse(c.x, c.y, c.rx, c.ry, 0, 0, Math.PI * 2);
+        mapCtx.fill();
+    }
+    mapCtx.restore();
+}
+
+function generateClouds(W, H) {
+    const clouds = [];
+    const count = 3 + Math.floor(Math.random() * 3);
+    for (let i = 0; i < count; i++) {
+        clouds.push({
+            x: Math.random() * W,
+            y: Math.random() * H * 0.6,
+            rx: 120 + Math.random() * 100,
+            ry: 40 + Math.random() * 40,
+            driftX: 0.15 + Math.random() * 0.25,
+            alpha: 0.12 + Math.random() * 0.12,
+        });
+    }
+    return clouds;
+}
+
+function generateCustomParticles(W, H) {
+    const parts = [];
+    for (let i = 0; i < 25; i++) {
+        parts.push({
+            x: Math.random() * W,
+            y: Math.random() * H,
+            r: 0.8 + Math.random() * 1.8,
+            vx: (Math.random() - 0.5) * 0.2,
+            vy: -0.15 - Math.random() * 0.25,
+            phase: Math.random() * Math.PI * 2,
+            speed: 0.5 + Math.random() * 1.0,
+        });
+    }
+    return parts;
+}
+
+function drawCustomParticles(W, H, hue, sat, lum, maxAlpha, driftStrength) {
+    if (!customParticlesState) customParticlesState = generateCustomParticles(W, H);
+    mapCtx.save();
+    for (const p of customParticlesState) {
+        p.x += p.vx + Math.sin(starTime * p.speed + p.phase) * driftStrength * 0.25;
+        p.y += p.vy;
+        if (p.x < -10) p.x = W + 10;
+        if (p.x > W + 10) p.x = -10;
+        if (p.y < -10) p.y = H + 10;
+        const alpha = maxAlpha * (0.3 + Math.sin(starTime * 1.5 + p.phase) * 0.3);
+        mapCtx.beginPath();
+        mapCtx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+        mapCtx.fillStyle = `hsla(${hue}, ${sat}%, ${lum}%, ${alpha})`;
+        mapCtx.fill();
+    }
+    mapCtx.restore();
+}
+
+function getCharacterColor(name) {
+    let hash = 0;
+    for (let i = 0; i < name.length; i++) {
+        hash = name.charCodeAt(i) + ((hash << 5) - hash);
+    }
+    const hue = Math.abs(hash) % 360;
+    return `hsla(${hue}, 85%, 65%, 0.85)`;
+}
+
+function drawMinimap(W, H, nodeMap, edges, t) {
+    const s = settings();
+    if (!s.showMinimap) return;
+
+    const size = minimapBounds.size;
+    const margin = minimapBounds.margin;
+    const mx = W - size - margin;
+    const my = H - size - margin;
+
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    let hasNodes = false;
+    for (const node of Object.values(nodeMap)) {
+        minX = Math.min(minX, node.x);
+        maxX = Math.max(maxX, node.x);
+        minY = Math.min(minY, node.y);
+        maxY = Math.max(maxY, node.y);
+        hasNodes = true;
+    }
+
+    if (!hasNodes) return;
+
+    const pad = 60;
+    minX -= pad; maxX += pad; minY -= pad; maxY += pad;
+    const boxW = maxX - minX;
+    const boxH = maxY - minY;
+    
+    // Save bounds to state for click handling
+    minimapBounds.minX = minX;
+    minimapBounds.maxX = maxX;
+    minimapBounds.minY = minY;
+    minimapBounds.maxY = maxY;
+
+    const scaleX = size / boxW;
+    const scaleY = size / boxH;
+    const scale = Math.min(scaleX, scaleY);
+
+    const offsetX = mx + (size - boxW * scale) / 2;
+    const offsetY = my + (size - boxH * scale) / 2;
+
+    const mapToMinimap = (x, y) => ({
+        x: offsetX + (x - minX) * scale,
+        y: offsetY + (y - minY) * scale,
+    });
+
+    mapCtx.save();
+    mapCtx.fillStyle = 'rgba(0, 0, 0, 0.45)';
+    mapCtx.strokeStyle = `rgba(${t.edgeColor}, 0.25)`;
+    mapCtx.lineWidth = 1;
+    mapCtx.beginPath();
+    mapCtx.roundRect(mx, my, size, size, 8);
+    mapCtx.fill();
+    mapCtx.stroke();
+
+    mapCtx.beginPath();
+    mapCtx.roundRect(mx + 1, my + 1, size - 2, size - 2, 8);
+    mapCtx.clip();
+
+    mapCtx.strokeStyle = `rgba(${t.edgeColor}, 0.15)`;
+    mapCtx.lineWidth = 0.5;
+    for (const [uName, vName] of edges) {
+        const u = nodeMap[uName], v = nodeMap[vName];
+        if (u && v) {
+            const p1 = mapToMinimap(u.x, u.y);
+            const p2 = mapToMinimap(v.x, v.y);
+            mapCtx.beginPath();
+            mapCtx.moveTo(p1.x, p1.y);
+            mapCtx.lineTo(p2.x, p2.y);
+            mapCtx.stroke();
+        }
+    }
+
+    for (const node of Object.values(nodeMap)) {
+        const p = mapToMinimap(node.x, node.y);
+        mapCtx.beginPath();
+        mapCtx.arc(p.x, p.y, 2.5, 0, Math.PI * 2);
+        mapCtx.fillStyle = s.nodeColor;
+        mapCtx.fill();
+    }
+
+    const locs = chatLocations();
+    const latestEntry = locs[locs.length - 1];
+    if (latestEntry) {
+        const latestPath = parsePath(latestEntry.location);
+        if (pathStartsWith(latestPath, viewPath) && latestPath.length > viewPath.length) {
+            const currentLevelLoc = latestPath[viewPath.length];
+            const node = nodeMap[currentLevelLoc];
+            if (node) {
+                const p = mapToMinimap(node.x, node.y);
+                mapCtx.beginPath();
+                mapCtx.arc(p.x, p.y, 3.5, 0, Math.PI * 2);
+                mapCtx.fillStyle = s.activeColor;
+                mapCtx.fill();
+            }
+        }
+    }
+
+    const dpr = window.devicePixelRatio || 1;
+    const screenW = mapCanvas.width / dpr;
+    const screenH = mapCanvas.height / dpr;
+    const topLeft = screenToWorld(0, 0);
+    const bottomRight = screenToWorld(screenW, screenH);
+
+    const vp1 = mapToMinimap(topLeft.x, topLeft.y);
+    const vp2 = mapToMinimap(bottomRight.x, bottomRight.y);
+
+    mapCtx.strokeStyle = 'rgba(255, 255, 255, 0.45)';
+    mapCtx.lineWidth = 1;
+    mapCtx.beginPath();
+    mapCtx.rect(vp1.x, vp1.y, vp2.x - vp1.x, vp2.y - vp1.y);
+    mapCtx.stroke();
+
+    mapCtx.restore();
+}
+
 function renderFrame() {
     if (!mapCtx || !mapCanvas) return;
     const s = settings();
@@ -1379,54 +1856,35 @@ function renderFrame() {
     mapCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
     mapCtx.clearRect(0, 0, W, H);
 
-    // Theme
     const t = getTheme();
 
-    // Background — multi-stop gradient for depth
-    const bgGrad = mapCtx.createRadialGradient(W / 2, H / 2, 0, W / 2, H / 2, Math.max(W, H) * 0.75);
-    bgGrad.addColorStop(0, t.bgInner);
-    bgGrad.addColorStop(0.5, t.bgOuter);
-    bgGrad.addColorStop(1, t.bgOuter);
-    mapCtx.fillStyle = bgGrad;
-    mapCtx.fillRect(0, 0, W, H);
+    // Time of Day Background Rendering
+    const phase = getTimeOfDayPhase();
+    renderBackgroundByPhase(W, H, phase, t);
 
-    // Secondary subtle glow spot that drifts
-    const glowX = W * 0.5 + Math.sin(starTime * 0.15) * W * 0.2;
-    const glowY = H * 0.5 + Math.cos(starTime * 0.12) * H * 0.15;
-    const bgGlow = mapCtx.createRadialGradient(glowX, glowY, 0, glowX, glowY, Math.max(W, H) * 0.4);
-    bgGlow.addColorStop(0, `hsla(${(t.starHueA + t.starHueB) / 2}, ${t.starSat}%, 20%, 0.04)`);
-    bgGlow.addColorStop(1, 'transparent');
-    mapCtx.fillStyle = bgGlow;
-    mapCtx.fillRect(0, 0, W, H);
-
-    drawStarfield(W, H);
-    drawAmbientParticles(W, H);
     if (is3DMode) draw3DGrid(W, H, t);
 
-    // Layer transition animation
     let transAlpha = 1;
     let transZoom = 1;
     if (layerTransition.active) {
         const elapsed = performance.now() - layerTransition.startTime;
         const progress = Math.min(elapsed / layerTransition.duration, 1);
-        const ease = 1 - Math.pow(1 - progress, 3); // ease-out cubic
+        const ease = 1 - Math.pow(1 - progress, 3);
         transAlpha = ease;
         if (layerTransition.direction === 'in') {
-            transZoom = 0.6 + 0.4 * ease;  // zoom in from 60% to 100%
+            transZoom = 0.6 + 0.4 * ease;
         } else {
-            transZoom = 1.4 - 0.4 * ease;  // zoom out from 140% to 100%
+            transZoom = 1.4 - 0.4 * ease;
         }
         if (progress >= 1) layerTransition.active = false;
     }
 
-    // Camera
     mapCtx.save();
     mapCtx.globalAlpha = transAlpha;
     mapCtx.translate(W / 2 + camera.x, H / 2 + camera.y);
     mapCtx.scale(camera.zoom * transZoom, camera.zoom * transZoom);
     mapCtx.translate(-W / 2, -H / 2);
 
-    // Legend — count ALL unique full-path locations
     const countEl = document.getElementById('map-tracker-loc-count');
     const allUniqueLocs = [...new Set(locs.map(l => l.location))];
     if (countEl) countEl.textContent = `${allUniqueLocs.length} location${allUniqueLocs.length !== 1 ? 's' : ''}`;
@@ -1436,7 +1894,6 @@ function renderFrame() {
     if (vDot) vDot.style.background = s.nodeColor;
     if (aDot) aDot.style.background = s.activeColor;
 
-    // Get nodes at current viewPath level
     const uniqueLocs = getNodesAtLevel(locs, viewPath);
 
     if (uniqueLocs.length === 0) {
@@ -1453,7 +1910,6 @@ function renderFrame() {
         return;
     }
 
-    // Build edges at current viewPath level
     const movePath = [];
     for (const entry of locs) {
         const path = parsePath(entry.location);
@@ -1471,10 +1927,8 @@ function renderFrame() {
         if (!edgeSet.has(key)) { edgeSet.add(key); edges.push([movePath[i - 1], movePath[i]]); }
     }
 
-    // Layout
     const layout = computeLayout(uniqueLocs, edges, W, H);
 
-    // Build node data using hierarchy helpers
     const nodeMap = {};
     nodePositions = {};
     for (const loc of uniqueLocs) {
@@ -1495,7 +1949,6 @@ function renderFrame() {
         nodeMap[loc] = { x: pos.x, y: pos.y, visits, characters, hasChildren: nodeHasChildren(locs, viewPath, loc), childCount: getChildCount(locs, viewPath, loc) };
     }
 
-    // Determine current location at this level
     const latestEntry = locs[locs.length - 1];
     let currentLoc = null;
     if (latestEntry) {
@@ -1505,10 +1958,17 @@ function renderFrame() {
         }
     }
 
-    // ─── 3D projection pass ───
+    // Fog of War opacity calculations
+    let visibilities = {};
+    if (s.showFogOfWar) {
+        visibilities = computeNodeVisibilities(uniqueLocs, edges, currentLoc);
+    } else {
+        uniqueLocs.forEach(loc => visibilities[loc] = 1.0);
+    }
+
     if (is3DMode) {
         for (const [locName, node] of Object.entries(nodeMap)) {
-            const z = (node.y - H / 2) * 0.4; // depth from Y position
+            const z = (node.y - H / 2) * 0.4;
             const proj = projectIso(node.x, node.y, z, W, H);
             node.x = proj.x;
             node.y = proj.y;
@@ -1518,21 +1978,49 @@ function renderFrame() {
         }
     }
 
-    // ─── Sort order (back-to-front for 3D) ───
     const drawOrder = Object.entries(nodeMap);
     if (is3DMode) drawOrder.sort((a, b) => b[1]._depth - a[1]._depth);
 
-    // ─── Draw edges ───
+    // Draw Travel Path Lines (Chronological Sequence)
+    if (s.showTravelPaths && movePath.length > 1) {
+        mapCtx.save();
+        mapCtx.strokeStyle = `rgba(${t.edgeColor}, 0.22)`;
+        mapCtx.lineWidth = 1.8;
+        mapCtx.setLineDash([4, 4]);
+        mapCtx.beginPath();
+        for (let i = 1; i < movePath.length; i++) {
+            const from = nodeMap[movePath[i - 1]];
+            const to = nodeMap[movePath[i]];
+            if (from && to && from !== to) {
+                const fromVis = visibilities[movePath[i - 1]] || 1.0;
+                const toVis = visibilities[movePath[i]] || 1.0;
+                mapCtx.globalAlpha = Math.min(fromVis, toVis) * 0.6;
+                const midX = (from.x + to.x) / 2, midY = (from.y + to.y) / 2;
+                const perpX = -(to.y - from.y) * 0.1, perpY = (to.x - from.x) * 0.1;
+                if (i === 1) mapCtx.moveTo(from.x, from.y);
+                mapCtx.quadraticCurveTo(midX + perpX, midY + perpY, to.x, to.y);
+            }
+        }
+        mapCtx.stroke();
+        mapCtx.restore();
+    }
+
+    // Draw standard Edges
     for (let i = 1; i < movePath.length; i++) {
         const from = nodeMap[movePath[i - 1]], to = nodeMap[movePath[i]];
         if (!from || !to || from === to) continue;
         const isLatest = (i === movePath.length - 1);
         const edgeAlpha3D = is3DMode ? 0.7 : 1;
-        const alpha = (isLatest ? 0.5 : 0.12) * edgeAlpha3D;
+        const fromVis = visibilities[movePath[i - 1]] || 1.0;
+        const toVis = visibilities[movePath[i]] || 1.0;
+        const edgeVis = Math.min(fromVis, toVis);
+        
+        const alpha = (isLatest ? 0.5 : 0.12) * edgeAlpha3D * edgeVis;
         const midX = (from.x + to.x) / 2, midY = (from.y + to.y) / 2;
         const perpX = -(to.y - from.y) * 0.1, perpY = (to.x - from.x) * 0.1;
 
-        // Edge line
+        mapCtx.save();
+        mapCtx.globalAlpha = transAlpha * edgeVis;
         mapCtx.beginPath();
         mapCtx.moveTo(from.x, from.y);
         mapCtx.quadraticCurveTo(midX + perpX, midY + perpY, to.x, to.y);
@@ -1541,10 +2029,11 @@ function renderFrame() {
         mapCtx.setLineDash(isLatest ? [] : [3, 5]);
         mapCtx.stroke();
         mapCtx.setLineDash([]);
+        mapCtx.restore();
 
-        // Glow on active edge
-        if (isLatest) {
+        if (isLatest && edgeVis > 0.3) {
             mapCtx.save();
+            mapCtx.globalAlpha = transAlpha * edgeVis;
             mapCtx.beginPath();
             mapCtx.moveTo(from.x, from.y);
             mapCtx.quadraticCurveTo(midX + perpX, midY + perpY, to.x, to.y);
@@ -1555,8 +2044,7 @@ function renderFrame() {
             drawCurvedArrow(from, to, midX + perpX, midY + perpY, t);
         }
 
-        // Traveling energy particles along edges
-        if (isLatest) {
+        if (isLatest && edgeVis > 0.3) {
             for (let p = 0; p < 3; p++) {
                 const progress = ((starTime * 0.4 + p * 0.33) % 1);
                 const invP = 1 - progress;
@@ -1575,14 +2063,16 @@ function renderFrame() {
         }
     }
 
-    // ─── 3D drop shadows (before nodes) ───
     if (is3DMode) {
         for (const [locName, node] of drawOrder) {
+            const opacity = visibilities[locName] || 1.0;
+            if (opacity <= 0.1) continue;
             const charCount = Object.keys(node.characters).length;
             const rawR = 28 + Math.min(charCount * 3, 12) + Math.min(node.visits * 0.5, 6);
             const scaledR = rawR * (node._scale || 1);
             const shadowY = node.y + scaledR * 1.2;
             mapCtx.save();
+            mapCtx.globalAlpha = transAlpha * opacity;
             const shadowGrad = mapCtx.createRadialGradient(node.x, shadowY, 0, node.x, shadowY, scaledR * 1.3);
             shadowGrad.addColorStop(0, 'rgba(0,0,0,0.18)');
             shadowGrad.addColorStop(1, 'rgba(0,0,0,0)');
@@ -1594,18 +2084,49 @@ function renderFrame() {
         }
     }
 
-    // ─── Draw nodes ───
+    // Process Travel Animations & update charLastKnownLoc state
+    for (const [locName, node] of drawOrder) {
+        for (const charName of Object.keys(node.characters)) {
+            const prevLoc = charLastKnownLoc[charName];
+            if (prevLoc && prevLoc !== locName) {
+                const fromPos = nodePositions[prevLoc];
+                if (fromPos && node.x !== undefined) {
+                    travelAnimations.push({
+                        character: charName,
+                        from: prevLoc,
+                        to: locName,
+                        startTime: performance.now(),
+                        duration: 1200,
+                        color: getCharacterColor(charName),
+                    });
+                }
+            }
+            charLastKnownLoc[charName] = locName;
+        }
+    }
+
+    // Draw nodes
     for (const [locName, node] of drawOrder) {
         const isCurrent = locName === currentLoc;
         const isSelected = locName === selectedNode;
         const charCount = Object.keys(node.characters).length;
-        const baseR = (28 + Math.min(charCount * 3, 12) + Math.min(node.visits * 0.5, 6)) * (is3DMode ? (node._scale || 1) : 1);
+        
+        // Node spawn animation scaling
+        if (!nodeDiscoveryTimes[locName]) {
+            nodeDiscoveryTimes[locName] = performance.now();
+        }
+        const spawnScale = Math.min(1.0, (performance.now() - nodeDiscoveryTimes[locName]) / 500);
+
+        const baseR = (28 + Math.min(charCount * 3, 12) + Math.min(node.visits * 0.5, 6)) * (is3DMode ? (node._scale || 1) : 1) * spawnScale;
         const color = isCurrent ? s.activeColor : s.nodeColor;
         const rgb = hexToRGB(color);
+        const opacity = visibilities[locName] || 1.0;
 
         nodePositions[locName] = { x: node.x, y: node.y, r: baseR };
 
-        // Selection ring
+        mapCtx.save();
+        mapCtx.globalAlpha = transAlpha * opacity * spawnScale;
+
         if (isSelected) {
             mapCtx.save();
             mapCtx.beginPath();
@@ -1619,7 +2140,6 @@ function renderFrame() {
             mapCtx.restore();
         }
 
-        // Outer ambient glow (all nodes)
         mapCtx.save();
         const ambGlow = mapCtx.createRadialGradient(node.x, node.y, baseR * 0.5, node.x, node.y, baseR + 20);
         ambGlow.addColorStop(0, `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, 0.06)`);
@@ -1630,7 +2150,6 @@ function renderFrame() {
         mapCtx.fill();
         mapCtx.restore();
 
-        // Pulse glow (current node — bigger, more vibrant)
         if (isCurrent) {
             const pulse = 0.6 + Math.sin(starTime * 2.0) * 0.2;
             mapCtx.save();
@@ -1645,10 +2164,7 @@ function renderFrame() {
             mapCtx.restore();
         }
 
-        // Disc / Sphere rendering
         if (is3DMode) {
-            // === 3D Sphere ===
-            // Base sphere body
             mapCtx.beginPath();
             mapCtx.arc(node.x, node.y, baseR, 0, Math.PI * 2);
             const bodyGrad = mapCtx.createRadialGradient(
@@ -1662,7 +2178,6 @@ function renderFrame() {
             mapCtx.fillStyle = bodyGrad;
             mapCtx.fill();
 
-            // Fresnel rim glow (bright edge ring)
             mapCtx.save();
             mapCtx.beginPath();
             mapCtx.arc(node.x, node.y, baseR, 0, Math.PI * 2);
@@ -1676,7 +2191,6 @@ function renderFrame() {
             mapCtx.stroke();
             mapCtx.restore();
 
-            // Latitude band (animated equator-like ring)
             mapCtx.save();
             const bandAngle = starTime * 0.3;
             const bandY = node.y + Math.sin(bandAngle) * baseR * 0.15;
@@ -1689,7 +2203,6 @@ function renderFrame() {
             mapCtx.stroke();
             mapCtx.restore();
 
-            // Specular highlight spot (upper-left)
             const hlX = node.x - baseR * 0.3;
             const hlY = node.y - baseR * 0.3;
             const hlR = baseR * 0.35;
@@ -1702,7 +2215,6 @@ function renderFrame() {
             mapCtx.fillStyle = specGrad;
             mapCtx.fill();
 
-            // Environment reflection (color-shifted secondary highlight)
             const envX = node.x + baseR * 0.2;
             const envY = node.y + baseR * 0.25;
             const envR = baseR * 0.45;
@@ -1715,7 +2227,6 @@ function renderFrame() {
             mapCtx.fillStyle = envGrad;
             mapCtx.fill();
         } else {
-            // === 2D Frosted glass disc ===
             const dg = mapCtx.createRadialGradient(node.x - baseR * 0.25, node.y - baseR * 0.25, 0, node.x, node.y, baseR);
             dg.addColorStop(0, `rgba(${Math.min(255, rgb.r + 60)}, ${Math.min(255, rgb.g + 60)}, ${Math.min(255, rgb.b + 60)}, 0.4)`);
             dg.addColorStop(0.6, `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, 0.15)`);
@@ -1725,12 +2236,10 @@ function renderFrame() {
             mapCtx.fillStyle = dg;
             mapCtx.fill();
 
-            // Rim highlight
             mapCtx.lineWidth = isCurrent ? 2.5 : 1.2;
             mapCtx.strokeStyle = `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, ${isCurrent ? 0.85 : 0.35})`;
             mapCtx.stroke();
 
-            // Top highlight arc (glass shine)
             mapCtx.save();
             mapCtx.beginPath();
             mapCtx.arc(node.x, node.y, baseR - 2, -Math.PI * 0.7, -Math.PI * 0.3);
@@ -1740,7 +2249,6 @@ function renderFrame() {
             mapCtx.restore();
         }
 
-        // Inner ring for current
         if (isCurrent) {
             mapCtx.beginPath();
             mapCtx.arc(node.x, node.y, baseR - 5, 0, Math.PI * 2);
@@ -1748,7 +2256,6 @@ function renderFrame() {
             mapCtx.strokeStyle = `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, 0.25)`;
             mapCtx.stroke();
 
-            // Core light
             const coreGlow = mapCtx.createRadialGradient(node.x, node.y, 0, node.x, node.y, baseR * 0.4);
             coreGlow.addColorStop(0, `rgba(${Math.min(255, rgb.r + 80)}, ${Math.min(255, rgb.g + 80)}, ${Math.min(255, rgb.b + 80)}, 0.15)`);
             coreGlow.addColorStop(1, 'transparent');
@@ -1758,7 +2265,6 @@ function renderFrame() {
             mapCtx.fill();
         }
 
-        // Orbiting particles (current node)
         if (isCurrent) {
             for (let oi = 0; oi < 4; oi++) {
                 const orbitR = baseR + 14;
@@ -1773,7 +2279,6 @@ function renderFrame() {
             }
         }
 
-        // ─── Child indicator (dashed outer ring + count) ───
         if (node.hasChildren) {
             mapCtx.save();
             mapCtx.beginPath();
@@ -1786,7 +2291,6 @@ function renderFrame() {
             mapCtx.setLineDash([]);
             mapCtx.restore();
 
-            // Child count badge
             mapCtx.textAlign = 'center';
             mapCtx.textBaseline = 'middle';
             mapCtx.font = '600 8px "Segoe UI", system-ui, sans-serif';
@@ -1794,7 +2298,6 @@ function renderFrame() {
             mapCtx.fillText(`▸ ${node.childCount}`, node.x, node.y + baseR + 18);
         }
 
-        // ─── Labels ───
         mapCtx.textAlign = 'center';
         mapCtx.textBaseline = 'middle';
         mapCtx.font = isCurrent ? '600 12px "Segoe UI", system-ui, sans-serif' : '500 11px "Segoe UI", system-ui, sans-serif';
@@ -1882,6 +2385,118 @@ function drawCurvedArrow(from, to, cpX, cpY, theme) {
     mapCtx.restore();
 }
 
+async function scanHistoryAI() {
+    const ctx = getContext();
+    const chat = ctx.chat;
+    if (!chat || chat.length === 0) {
+        toastr.warning('No chat history to scan.', 'Map Tracker');
+        return;
+    }
+
+    const btn = $('#map_tracker_scan_history');
+    btn.prop('disabled', true).val('Scanning history...');
+    toastr.info('Starting AI historical scan of chat. This may take a moment...', 'Map Tracker');
+
+    try {
+        const locs = chatLocations();
+        const trackedIndices = new Set(locs.map(l => l.messageIndex).filter(idx => idx !== -1));
+        const messagesToScan = [];
+
+        for (let i = 0; i < chat.length; i++) {
+            if (!trackedIndices.has(i) && chat[i] && chat[i].mes) {
+                messagesToScan.push({ index: i, sender: chat[i].name || (chat[i].is_user ? 'User' : 'AI'), text: chat[i].mes });
+            }
+        }
+
+        if (messagesToScan.length === 0) {
+            toastr.success('All messages are already tracked!', 'Map Tracker');
+            btn.prop('disabled', false).val('🤖 Scan Chat History (AI)');
+            return;
+        }
+
+        const chunkSize = 12;
+        let parsedCount = 0;
+
+        for (let c = 0; c < messagesToScan.length; c += chunkSize) {
+            const chunk = messagesToScan.slice(c, c + chunkSize);
+            let formattedChat = '';
+            for (const msg of chunk) {
+                const cleanText = msg.text.replace(/\[MAP:\s*[^\]]*\]/gi, '').trim();
+                formattedChat += `[Message ${msg.index}] (${msg.sender}): ${cleanText}\n\n`;
+            }
+
+            const systemPrompt = `Analyze the chat history chunk provided and extract character locations and activities.
+Return ONLY a raw JSON array matching this schema:
+[
+  { "messageIndex": <number>, "location": "Location Name (use > for hierarchy, e.g. 'City > Market > Tavern')", "character": "Character Name", "activity": "Brief activity description" }
+]
+
+Rules:
+- Only output entries for characters explicitly present and locations clearly mentioned.
+- Keep activities short and descriptive.
+- Use > for hierarchical locations.
+- Be consistent with existing location names if they exist.
+- Return ONLY the JSON array. Do not include markdown codeblock tags (like \`\`\`json) or any explanations.`;
+
+            const prompt = `Here is the chat history to analyze:\n\n${formattedChat}`;
+
+            try {
+                const response = await generateRaw({ prompt, systemPrompt });
+                if (!response) continue;
+
+                let cleaned = response.trim();
+                if (cleaned.startsWith('```')) {
+                    cleaned = cleaned.replace(/^```[a-zA-Z]*\n/, '').replace(/\n```$/, '').trim();
+                }
+
+                const startIdx = cleaned.indexOf('[');
+                const endIdx = cleaned.lastIndexOf(']');
+                if (startIdx !== -1 && endIdx !== -1 && endIdx > startIdx) {
+                    cleaned = cleaned.substring(startIdx, endIdx + 1);
+                }
+
+                const data = JSON.parse(cleaned);
+                if (Array.isArray(data)) {
+                    for (const entry of data) {
+                        const msgIdx = parseInt(entry.messageIndex);
+                        if (isNaN(msgIdx) || msgIdx < 0 || msgIdx >= chat.length) continue;
+                        const locName = canonicalLocation(entry.location || 'Unknown');
+                        const charName = (entry.character || 'Unknown').trim();
+                        const activity = (entry.activity || '').trim();
+
+                        const already = locs.some(l => l.messageIndex === msgIdx && l.location === locName && l.character === charName);
+                        if (!already) {
+                            locs.push({
+                                character: charName,
+                                location: locName,
+                                activity,
+                                messageIndex: msgIdx,
+                                timestamp: Date.now(),
+                            });
+                            parsedCount++;
+                        }
+                    }
+                }
+            } catch (e) {
+                console.error(LOG_PREFIX, 'Failed to parse AI response for chunk', c, e);
+            }
+        }
+
+        if (parsedCount > 0) {
+            saveLocs();
+            injectPrompt();
+            toastr.success(`Scan complete! Discovered and added ${parsedCount} location entries.`, 'Map Tracker');
+        } else {
+            toastr.info('Scan complete. No new location entries found.', 'Map Tracker');
+        }
+    } catch (err) {
+        console.error(LOG_PREFIX, 'Error during historical scan', err);
+        toastr.error('An error occurred during historical scan.', 'Map Tracker');
+    } finally {
+        btn.prop('disabled', false).val('🤖 Scan Chat History (AI)');
+    }
+}
+
 /* ──────────────────── settings UI ──────────────────── */
 
 async function loadSettingsUI() {
@@ -1896,6 +2511,26 @@ async function loadSettingsUI() {
         s.useToolCalling = !!$(this).prop('checked'); injectPrompt(); registerMapTool(); saveSettingsDebounced();
         updateToolCallingStatus();
     });
+    $('#map_tracker_use_fuzzy_matching').prop('checked', s.useFuzzyMatching).on('change', function () {
+        s.useFuzzyMatching = !!$(this).prop('checked'); saveSettingsDebounced();
+    });
+    $('#map_tracker_show_minimap').prop('checked', s.showMinimap).on('change', function () {
+        s.showMinimap = !!$(this).prop('checked'); saveSettingsDebounced();
+    });
+    $('#map_tracker_show_fog_of_war').prop('checked', s.showFogOfWar).on('change', function () {
+        s.showFogOfWar = !!$(this).prop('checked'); saveSettingsDebounced();
+    });
+    $('#map_tracker_show_travel_paths').prop('checked', s.showTravelPaths).on('change', function () {
+        s.showTravelPaths = !!$(this).prop('checked'); saveSettingsDebounced();
+    });
+    
+    const timeOfDaySel = document.getElementById('map_tracker_time_of_day');
+    if (timeOfDaySel) {
+        $(timeOfDaySel).val(s.timeOfDayMode).on('change', function () {
+            s.timeOfDayMode = $(this).val(); saveSettingsDebounced();
+        });
+    }
+
     $('#map_tracker_prompt').val(s.prompt).on('input', function () {
         s.prompt = $(this).val(); injectPrompt(); saveSettingsDebounced();
     });
@@ -1904,6 +2539,7 @@ async function loadSettingsUI() {
     });
     $('#map_tracker_open_map').on('click', togglePopout);
     $('#map_tracker_clear_history').on('click', clearAllNodes);
+    $('#map_tracker_scan_history').on('click', scanHistoryAI);
     $('#map_tracker_node_color').val(s.nodeColor).on('input', function () {
         s.nodeColor = $(this).val(); saveSettingsDebounced();
     });

@@ -10,24 +10,48 @@
                     <input type="checkbox" id="map_tracker_enabled" />
                     <span>Enable location prompt injection</span>
                 </label>
-                <small>When enabled, a hidden instruction is added to the AI prompt asking it to include location tags
-                    in responses.</small>
+                <small>When enabled, a hidden instruction is added to the AI prompt asking it to include location tags in responses.</small>
             </div>
             <div class="map-tracker-block">
                 <label class="checkbox_label" for="map_tracker_use_tool_calling">
                     <input type="checkbox" id="map_tracker_use_tool_calling" />
                     <span>Use Tool Calling (recommended)</span>
                 </label>
-                <small>When enabled and supported by your API, the AI uses a function call instead of text tags — more
-                    reliable, cleaner messages.</small>
-                <div id="map_tracker_tool_status" style="font-size: 11px; margin-top: 4px; opacity: 0.7;">Checking...
-                </div>
+                <small>When enabled and supported by your API, the AI uses a function call instead of text tags — more reliable, cleaner messages.</small>
+                <div id="map_tracker_tool_status" style="font-size: 11px; margin-top: 4px; opacity: 0.7;">Checking...</div>
+            </div>
+            <div class="map-tracker-block">
+                <label class="checkbox_label" for="map_tracker_use_fuzzy_matching">
+                    <input type="checkbox" id="map_tracker_use_fuzzy_matching" />
+                    <span>Enable Fuzzy Location Matching</span>
+                </label>
+                <small>Fuzzy matches location name variations (e.g. spelling or minor wording) to prevent duplicate map nodes.</small>
+            </div>
+            <div class="map-tracker-block">
+                <label class="checkbox_label" for="map_tracker_show_minimap">
+                    <input type="checkbox" id="map_tracker_show_minimap" />
+                    <span>Show Minimap</span>
+                </label>
+                <small>Renders a mini-map overview in the corner of the canvas with a viewport tracker.</small>
+            </div>
+            <div class="map-tracker-block">
+                <label class="checkbox_label" for="map_tracker_show_fog_of_war">
+                    <input type="checkbox" id="map_tracker_show_fog_of_war" />
+                    <span>Enable Fog of War</span>
+                </label>
+                <small>Dims map locations and hides titles of areas that are far from the active location.</small>
+            </div>
+            <div class="map-tracker-block">
+                <label class="checkbox_label" for="map_tracker_show_travel_paths">
+                    <input type="checkbox" id="map_tracker_show_travel_paths" />
+                    <span>Visualize Travel Paths & Animations</span>
+                </label>
+                <small>Draws sequential travel lines and animates character tokens as they move between locations.</small>
             </div>
             <hr />
             <div class="map-tracker-block">
                 <label for="map_tracker_prompt">Custom Prompt Template</label>
-                <textarea id="map_tracker_prompt" class="text_pole textarea_compact" rows="4"
-                    placeholder="System prompt for location tagging..."></textarea>
+                <textarea id="map_tracker_prompt" class="text_pole textarea_compact" rows="4" placeholder="System prompt for location tagging..."></textarea>
                 <div class="flex-container">
                     <input id="map_tracker_restore_prompt" class="menu_button" type="button" value="Restore Default" />
                 </div>
@@ -39,11 +63,23 @@
                     <input id="map_tracker_open_map" class="menu_button" type="button" value="🗺️ Open Map" />
                     <input id="map_tracker_clear_history" class="menu_button" type="button" value="🗑️ Clear History" />
                 </div>
+                <div class="flex-container" style="margin-top: 6px;">
+                    <input id="map_tracker_scan_history" class="menu_button" type="button" style="width: 100%;" value="🤖 Scan Chat History (AI)" />
+                </div>
             </div>
             <hr />
             <div class="map-tracker-block">
                 <label for="map_tracker_theme">Theme</label>
                 <select id="map_tracker_theme" class="text_pole"></select>
+            </div>
+            <div class="map-tracker-block">
+                <label for="map_tracker_time_of_day">Canvas Time-of-Day Mode</label>
+                <select id="map_tracker_time_of_day" class="text_pole">
+                    <option value="dynamic">☀️/🌙 Dynamic (System Time)</option>
+                    <option value="day">☀️ Day Sky & Clouds</option>
+                    <option value="sunset">🌅 Golden Sunset</option>
+                    <option value="night">🌌 Cosmic Starry Night</option>
+                </select>
             </div>
             <hr />
             <div class="map-tracker-block map-tracker-color-row">
